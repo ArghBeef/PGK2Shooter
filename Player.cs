@@ -1,45 +1,116 @@
-﻿using UnityEngine;
-using Unity.Netcode;
 using Unity.Multiplayer.Center.NetcodeForGameObjectsExample;
+using Unity.Netcode;
+using UnityEngine;
+using System.Collections;
 
 [RequireComponent(typeof(Rigidbody), typeof(ClientNetworkTransform))]
 public class Player : NetworkBehaviour
 {
+    [SerializeField] float baseMovementSpeed = 5f;
+    [SerializeField] Transform upperBody;
+    [SerializeField] Transform firePoint;
+    [SerializeField] WeaponBehaviour weaponPrefab;
 
-    [Header("Movement")]
-    public float baseMovementSpeed = 5f;
-    public float dashForce = 20f; //idk dash is not functionla
-    public float dashCooldown = 1f;
+    readonly NetworkVariable<NetworkObjectReference> weaponRef =
+        new(writePerm: NetworkVariableWritePermission.Server);
 
-    [Header("Parts")]
-    public Transform upperBody; //Later will delete all of this
-    public Transform firePoint;
-    public WeaponBehaviour currentWeaponPrefab;
-
+    readonly NetworkVariable<Vector3> aimDirection =
+        new(Vector3.forward, writePerm: NetworkVariableWritePermission.Owner);
 
     WeaponBehaviour currentWeapon;
     Rigidbody rb;
-    float h, v, nextDashTime;
+    float h, v;
 
-    public WeaponBehaviour CurrentWeapon => currentWeapon; //hud
+    public WeaponBehaviour CurrentWeapon => currentWeapon;
 
-    void Start()
+    public float BaseMovementSpeed
+    {
+        get => baseMovementSpeed;
+        set => baseMovementSpeed = value;
+    }
+
+    void Awake()
     {
         rb = GetComponent<Rigidbody>();
         rb.freezeRotation = true;
     }
 
+    public override void OnNetworkSpawn()
+    {
+        weaponRef.OnValueChanged += OnWeaponChanged;
+
+        if (weaponRef.Value.TryGet(out var obj))
+            currentWeapon = obj.GetComponent<WeaponBehaviour>();
+
+        AssignUpperBody();
+
+        if (IsServer)
+        {
+            if (SpawnManager.Instance == null)
+            {
+                StartCoroutine(WaitForSpawnManagerAndPlace());
+                return;
+            }
+
+            PlaceAtSpawn((int)OwnerClientId + 1);
+        }
+    }
+
+    IEnumerator WaitForSpawnManagerAndPlace()
+    {
+        yield return new WaitUntil(() => SpawnManager.Instance != null);
+        PlaceAtSpawn((int)OwnerClientId + 1);
+    }
+
+    void PlaceAtSpawn(int index)
+    {
+        var spawn = SpawnManager.Instance.GetSpawnPointForPlayer(index);
+        if (spawn != null)
+        {
+            transform.position = spawn.position;
+            transform.rotation = spawn.rotation;
+        }
+        else
+        {
+            Debug.LogError($"No spawn point found for player {OwnerClientId} (index {index})");
+        }
+    }
+
+    void AssignUpperBody()
+    {
+        if (upperBody == null)
+        {
+            var found = transform.Find("Top");
+            if (found != null)
+            {
+                upperBody = found;
+            }
+            else
+            {
+                Debug.LogError("Top not found");
+            }
+        }
+    }
+
     void Update()
     {
-        if (!IsOwner) return; 
-        ReadInputs();
-        UpdateAim();
+        if (upperBody == null) AssignUpperBody();
+
+        if (IsOwner)
+        {
+            ReadInputs();
+            UpdateAim();
+        }
+        else if (IsClient && IsSpawned && aimDirection.Value != Vector3.zero)
+        {
+            upperBody.forward = aimDirection.Value;
+        }
     }
 
     void FixedUpdate()
     {
         if (!IsOwner) return;
-        UpdateMovement();
+        Move();
     }
 
     void ReadInputs()
@@ -47,24 +118,23 @@ public class Player : NetworkBehaviour
         v = Input.GetAxis("Vertical");
         h = Input.GetAxis("Horizontal");
 
-        if (currentWeapon)
+        if (currentWeapon?.Data != null)
         {
-            bool held = Input.GetMouseButton(0);
-            bool down = Input.GetMouseButtonDown(0);
-            bool shoot = currentWeapon.data.isAutomatic ? held : down; //held i down for those automatic and one bullet
-            if (shoot) currentWeapon.TryFire(upperBody.forward);
-        }
+            bool trigger = currentWeapon.Data.isAutomatic
+                           ? Input.GetMouseButton(0)
+                           : Input.GetMouseButtonDown(0);
 
-        if (Input.GetKeyDown(KeyCode.Space) && Time.time >= nextDashTime)
-            Dash();
+            if (trigger)
+                currentWeapon.TryFire(upperBody.forward);
+        }
     }
 
-    void UpdateMovement()
+    void Move()
     {
         float speed = baseMovementSpeed *
-                      (currentWeapon ? currentWeapon.data.moveSpeedMultiplier : 1f);
+                     (currentWeapon ? currentWeapon.Data.moveSpeedMultiplier : 1f);
 
-        rb.linearVelocity = new Vector3(h, 0f, v) * speed;
+        rb.linearVelocity = new Vector3(h, 0, v) * speed;
         rb.angularVelocity = Vector3.zero;
     }
 
@@ -74,19 +144,14 @@ public class Player : NetworkBehaviour
         if (new Plane(Vector3.up, Vector3.zero).Raycast(ray, out var dist))
         {
             Vector3 dir = ray.GetPoint(dist) - upperBody.position;
-            dir.y = 0f;
+            dir.y = 0;
             if (dir.sqrMagnitude > 0.001f)
+            {
                 upperBody.forward = dir.normalized;
+                aimDirection.Value = dir.normalized;
+            }
         }
     }
-
-    //Delete it or change idk
-    void Dash()
-    {
-        nextDashTime = Time.time + dashCooldown;
-        rb.AddForce(upperBody.forward * dashForce, ForceMode.Impulse);
-    }
-
 
     [ServerRpc(RequireOwnership = false)]
     public void EquipServerRpc(NetworkObjectReference pickupRef)
@@ -96,17 +161,38 @@ public class Player : NetworkBehaviour
         var wp = pickupObj.GetComponent<WeaponPickup>();
         if (wp == null || wp.weaponData == null) return;
 
-        if (currentWeapon)
-            currentWeapon.NetworkObject.Despawn();
+        if (weaponPrefab == null) return;
 
-        var holder = Instantiate(currentWeaponPrefab, transform);
-        var netObj = holder.GetComponent<NetworkObject>();
+        if (weaponRef.Value.TryGet(out var old))
+            old.Despawn();
+
+        var weaponObj = Instantiate(weaponPrefab, transform);
+        var netObj = weaponObj.GetComponent<NetworkObject>();
         netObj.SpawnWithOwnership(OwnerClientId);
 
-        currentWeapon = holder;
-        currentWeapon.data = wp.weaponData;
-        currentWeapon.firePoint = firePoint;
+        weaponObj.Initialize(wp.weaponData, firePoint);
 
-        pickupObj.Despawn();
+        weaponRef.Value = netObj;
+    }
+
+    void OnWeaponChanged(NetworkObjectReference _, NetworkObjectReference newRef)
+    {
+        currentWeapon = newRef.TryGet(out var obj) ? obj.GetComponent<WeaponBehaviour>() : null;
+    }
+
+    public void Freeze(bool isFrozen)
+    {
+        GetComponent<Rigidbody>().isKinematic = isFrozen;
+        GetComponent<Collider>().enabled = !isFrozen;
+
+        foreach (var renderer in GetComponentsInChildren<Renderer>())
+            renderer.enabled = !isFrozen;
+    }
+
+    [ClientRpc]
+    public void TeleportClientRpc(Vector3 pos, Quaternion rot)
+    {
+        transform.SetPositionAndRotation(pos, rot);
+        rb.linearVelocity = Vector3.zero;
     }
 }
